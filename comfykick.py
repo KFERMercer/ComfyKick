@@ -54,6 +54,7 @@ DEFAULTS = {
     "prekick_exec": [],
     "pypi_list": [],
     "runtime_dir": XDG_CACHE_HOME / PROJECT_NAME,
+    "sync_custom_node_dependencies": True,
     "update": True,
     "venv_cache_dir": XDG_DATA_HOME / PROJECT_NAME / "venv_cache",
     "version": "latest",
@@ -197,22 +198,25 @@ def log_config(config: dict[str, Any]) -> None:
     log.info("Loaded configuration:\n%s", "\n".join(lines))
 
 
-def _resolve_extra_model_paths(config: dict[str, Any]) -> list[Path]:
+def _parse_extra_paths(
+    config: dict[str, Any],
+) -> list[tuple[str, Path, bool]]:
     """Parse ``config['extra_model_paths_yaml']``.
 
-    Returns the list of model sub-directories declared under sections
-    with ``is_default: true``.
+    Mirrors ComfyUI's ``utils.extra_config.load_extra_path_config``: every
+    section is honored, ``base_path`` is expanded and resolved against the
+    yaml directory when relative, and the entries of a section without
+    ``base_path`` are resolved against the yaml directory too.
+
+    Returns ``(folder_name, path, is_default)`` records in yaml order.
 
     Returns an empty list when:
     - the value is empty
     - the file does not exist
-    - the yaml has no section with ``is_default: true``
 
     Exits with an error when:
     - the yaml cannot be parsed
     - the top-level is not a mapping
-    - an ``is_default: true`` section has a missing or relative
-      ``base_path``
     """
     raw = config["extra_model_paths_yaml"]
     if not raw:
@@ -237,35 +241,27 @@ def _resolve_extra_model_paths(config: dict[str, Any]) -> list[Path]:
     if not isinstance(data, dict):
         die("%s must be a mapping at the top level.", raw)
 
-    extra_dirs = set()
+    yaml_dir = Path(os.path.abspath(raw)).parent
+    records = []
 
-    for section_name, section in data.items():
+    for section in data.values():
         if not isinstance(section, dict):
             continue
 
-        if section.get("is_default") is not True:
-            continue
-
         base_path = section.get("base_path")
-        if not (isinstance(base_path, str) and base_path):
-            die(
-                "section '%s' in %s is marked is_default "
-                "but has no base_path.",
-                section_name,
-                raw,
+        if isinstance(base_path, str) and base_path:
+            base_path = Path(
+                os.path.expandvars(os.path.expanduser(base_path))
             )
+            if not base_path.is_absolute():
+                base_path = yaml_dir / base_path
+        else:
+            base_path = yaml_dir
 
-        if not Path(base_path).is_absolute():
-            die(
-                "section '%s' in %s has a relative base_path '%s'. "
-                "Please use an absolute path.",
-                section_name,
-                raw,
-                base_path,
-            )
+        is_default = section.get("is_default") is True
 
         for key, value in section.items():
-            if key == "base_path":
+            if key in ("base_path", "is_default"):
                 continue
 
             if isinstance(value, str):
@@ -283,9 +279,44 @@ def _resolve_extra_model_paths(config: dict[str, Any]) -> list[Path]:
                 if not item:
                     continue
 
-                extra_dirs.add((Path(base_path) / item).resolve())
+                item_path = Path(item)
+                if not item_path.is_absolute():
+                    item_path = base_path / item_path
 
-    return list(extra_dirs)
+                records.append(
+                    (key, Path(os.path.normpath(item_path)), is_default)
+                )
+
+    return records
+
+
+def _resolve_extra_paths(
+    config: dict[str, Any],
+) -> tuple[list[Path], list[Path]]:
+    """Resolve the paths declared in ``extra_model_paths_yaml``.
+
+    Returns the directories to create (the entries of sections marked
+    ``is_default``), and the custom node directories ComfyUI scans, in
+    ``folder_paths.get_folder_paths("custom_nodes")`` order.
+    """
+    model_dirs: list[Path] = []
+    custom_node_dirs = [config["base_dir"] / "custom_nodes"]
+
+    for key, path, is_default in _parse_extra_paths(config):
+        if is_default and path not in model_dirs:
+            model_dirs.append(path)
+
+        if key != "custom_nodes" or path in custom_node_dirs:
+            continue
+
+        # Mirrors folder_paths.add_model_folder_path: a default entry is
+        # inserted at the front, so the last one declared ends up first.
+        if is_default:
+            custom_node_dirs.insert(0, path)
+        else:
+            custom_node_dirs.append(path)
+
+    return model_dirs, custom_node_dirs
 
 
 def create_directories(
@@ -666,10 +697,65 @@ def _run(
         raise subprocess.CalledProcessError(return_code, cmd)
 
 
+def _iter_custom_nodes(custom_node_dirs: list[Path]) -> list[Path]:
+    """Return the enabled custom node directories, in ComfyUI's load order.
+
+    Mirrors ``nodes.init_external_custom_nodes``: ``__pycache__``, entries
+    named ``*.disabled`` and non-directory entries are not loaded.
+    """
+    nodes = []
+    seen = set()
+
+    for node_dir in custom_node_dirs:
+        try:
+            entries = sorted(node_dir.iterdir())
+        except OSError as exc:
+            log.warning(
+                "Cannot scan custom node directory [%s]: %s",
+                node_dir,
+                exc,
+            )
+            continue
+
+        for entry in entries:
+            if entry.name == "__pycache__" or entry.name.endswith(
+                ".disabled"
+            ):
+                continue
+
+            if not entry.is_dir():
+                continue
+
+            try:
+                real_path = entry.resolve()
+            except OSError:
+                continue
+
+            if real_path in seen:
+                continue
+
+            seen.add(real_path)
+            nodes.append(entry)
+
+    return nodes
+
+
+def _uv_env(pypi_list: list[str]) -> dict[str, str]:
+    """Build the environment for uv invocations."""
+    env = os.environ | {
+        "UV_LINK_MODE": "copy",
+        "UV_PYTHON_DOWNLOADS": "never",
+    }
+    if pypi_list:
+        env["UV_INDEX"] = " ".join(pypi_list)
+    return env
+
+
 def install_dependencies(
     extracted_dir: Path,
     config: dict[str, Any],
     version_head: str,
+    custom_node_dirs: list[Path],
 ) -> None:
     """Install dependencies with uv.
 
@@ -681,11 +767,7 @@ def install_dependencies(
     Each user also has their own ``XDG_DATA_HOME`` namespace, so there
     is no inter-user contention on ``venv_cache_dir`` either.
     """
-    env = os.environ.copy()
-    env["UV_LINK_MODE"] = "copy"
-    env["UV_PYTHON_DOWNLOADS"] = "never"
-    if config["pypi_list"]:
-        env["UV_INDEX"] = " ".join(config["pypi_list"])
+    env = _uv_env(config["pypi_list"])
 
     venv_cache_dir = config["venv_cache_dir"]
     venv_link = extracted_dir / ".venv"
@@ -727,6 +809,30 @@ def install_dependencies(
             ]
         )
 
+    if config["sync_custom_node_dependencies"]:
+        nodes = _iter_custom_nodes(custom_node_dirs)
+
+        if nodes:
+            log.info(
+                "Syncing dependencies of %d custom node(s) ...",
+                len(nodes),
+            )
+
+        # Requirements go through the project dependency graph, so that
+        # the exact sync at the end does not prune them. They are
+        # installed before the extra packages, so that the latter win
+        # any conflict.
+        for node in nodes:
+            requirements = node / "requirements.txt"
+            if not requirements.is_file():
+                continue
+
+            log.info(
+                "Installing dependencies of custom node [%s] ...",
+                node.name,
+            )
+            run(["uv", "add", "--requirements", str(requirements)])
+
     extra_pkgs = config["extra_python_package"]
     if extra_pkgs:
         log.info("Installing extra packages ...")
@@ -735,6 +841,42 @@ def install_dependencies(
 
     log.info("Syncing venv packages ...")
     run(["uv", "sync"])
+
+
+def run_custom_node_install_scripts(
+    config: dict[str, Any],
+    extracted_dir: Path,
+    custom_node_dirs: list[Path],
+) -> None:
+    """Run the ``install.py`` of every enabled custom node.
+
+    Runs after ``install_dependencies()``, so the venv is complete and
+    whatever a script installs itself is not pruned by the exact sync.
+    """
+
+    script_name = "install.py"
+
+    install_scripts = [
+        node
+        for node in _iter_custom_nodes(custom_node_dirs)
+        if (node / script_name).is_file()
+    ]
+
+    if not install_scripts:
+        return
+
+    env = _uv_env(config["pypi_list"]) | {
+        "COMFYUI_PATH": str(extracted_dir),
+        "COMFYUI_FOLDERS_BASE_PATH": str(extracted_dir),
+    }
+
+    for node in install_scripts:
+        log.info("Running %s of custom node [%s] ...", script_name, node.name)
+        _run(
+            ["uv", "--project", str(extracted_dir), "run", script_name],
+            cwd=str(node),
+            env=env,
+        )
 
 
 def run_prekick_commands(
@@ -841,8 +983,8 @@ def main() -> None:
     if not config["github_token"]:
         log.info("Running without GitHub token.")
 
-    extra_dirs = _resolve_extra_model_paths(config)
-    create_directories(config, extra_dirs)
+    extra_dirs, custom_node_dirs = _resolve_extra_paths(config)
+    create_directories(config, [*extra_dirs, *custom_node_dirs])
 
     version_cache_dir = config["version_cache_dir"]
     version_head, tarball_url, tag_name = _resolve_version(
@@ -895,7 +1037,20 @@ def main() -> None:
     # hack. See <https://github.com/Comfy-Org/ComfyUI/issues/8764>
     (extracted_dir / "user").mkdir(exist_ok=True)
 
-    install_dependencies(extracted_dir, config, version_head)
+    install_dependencies(
+        extracted_dir,
+        config,
+        version_head,
+        custom_node_dirs,
+    )
+
+    # if config["sync_custom_node_dependencies"]:
+    #     run_custom_node_install_scripts(
+    #         config,
+    #         extracted_dir,
+    #         custom_node_dirs
+    #     )
+    
     run_prekick_commands(config, extracted_dir)
 
     log.info(

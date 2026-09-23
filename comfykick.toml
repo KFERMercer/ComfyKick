@@ -124,9 +124,13 @@
 # # Default: []
 # pypi_list              = []
 
+# # Sync the dependencies of the custom nodes.
+# # Default: true
+# sync_custom_node_dependencies = true
+
 # # Extra Python packages install.
-# # Can use this to bake in custom-node dependencies that are not yet
-# # pinned in ComfyUI's own requirements files.
+# # Installed after the custom node dependencies, so they win a conflict.
+# # Use this for packages that no custom node declares.
 # # e.g. `["flash-attn", "foo==1.2.3", "bar>=4.5.6"]`
 # # Default: []
 # extra_python_package   = []
